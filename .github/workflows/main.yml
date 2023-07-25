@@ -1,0 +1,169 @@
+name: movies-notifications
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10']
+
+    services:
+      postgres:
+        image: postgres:14.5-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_DB: notifications_database
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST: postgres
+          POSTGRES_PORT: 5432
+        options: >- 
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.0.5
+        ports:
+          - 6379:6379
+        options: >- 
+          --health-cmd "redis-cli ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      kafka:
+        image: confluentinc/cp-kafka:7.3.1
+        ports:
+          - 29092:29092
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+        options: >-
+          --health-cmd "nc -z localhost 9092 || exit -1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+      zookeeper:
+        image: zookeeper:3.8
+        options: >-
+          --health-cmd "nc -z localhost 2181 || exit -1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r backend/django_admin/requirements.txt --no-cache-dir
+          pip install -r backend/fastapi_receiver/requirements.txt --no-cache-dir
+          pip install -r backend/faust_worker/requirements.txt --no-cache-dir
+      - name: Lint with flake8
+        run: |
+          pip install wemake-python-styleguide flake8-html
+          flake8 backend --format=html --htmldir=flake8
+      - name: Lint with mypy
+        run: |
+          pip install mypy types-requests lxml 
+          mypy backend --html-report=mypy
+      - name: Run Admin Panel
+        run: |
+          cd backend/django_admin/src
+          nohup python manage.py runserver &
+      - name: Stop Admin Panel
+        run: |
+          kill $(ps aux | grep python | grep manage.py | awk '{print $2}')
+      - name: Run API
+        run: |
+          cd backend/fastapi_receiver/src
+          nohup python main.py &
+      - name: Stop API
+        run: |
+          kill $(ps aux | grep python | grep main.py | awk '{print $2}')
+      - name: Run Worker
+        run: |
+          cd backend/faust_worker/src
+          nohup python main.py worker &
+      - name: Stop Worker
+        run: |
+          kill $(ps aux | grep python | grep main.py | awk '{print $2}')
+      - name: Output results
+        uses: actions/upload-artifact@v3
+        with:
+          name: Report
+          path: |
+            flake8/
+            mypy/
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to Docker
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Push Backend to Docker Hub
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: backend/django_admin
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/notifications_admin:${{ vars.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/notifications_admin:latest
+      - name: Push Backend to Docker Hub
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: backend/fastapi_receiver
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/notifications_api:${{ vars.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/notifications_api:latest
+      - name: Push Backend to Docker Hub
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: backend/faust_worker
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/notifications_worker:${{ vars.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/notifications_worker:latest
+
+  send_message:
+    name: Send message
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Send message
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            В репозитории ${{ github.repository }} выполнен коммит:
+            Автор: ${{ github.event.commits[0].author.name }}
+            Сообщение: ${{ github.event.commits[0].message }}
+            Ссылка: https://github.com/${{ github.repository }}/commit/${{github.sha}}

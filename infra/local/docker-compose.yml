@@ -1,0 +1,115 @@
+x-postgres-env: &postgres-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: notifications_database
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+
+x-django-env: &django-env
+  DJANGO_SUPERUSER_USERNAME: admin
+  DJANGO_SUPERUSER_EMAIL: admin@mail.ru
+  DJANGO_SUPERUSER_PASSWORD: 1234
+  DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,[::1],django
+  DJANGO_SECRET_KEY: django-insecure-_o)z83b+i@jfjzbof_jn9#%dw*5q2yy3r6zzq-3azof#(vkf!#
+
+x-kafka-env: &kafka-env
+  KAFKA_HOST: kafka
+  KAFKA_PORT: 9092
+
+x-redis-env: &redis-env
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+
+services:
+  django:
+    build: ../../backend/django_admin
+    ports:
+      - 8000:8000
+    entrypoint: >
+      sh -c "python manage.py migrate &&
+             python manage.py createsuperuser --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+    environment:
+      PYTHONUNBUFFERED: 1
+      DJANGO_DEBUG: "True"
+      EVENT_SOURCING_URL: fastapi:8000
+      <<: [*postgres-env, *redis-env, *django-env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery:
+    build: ../../backend/django_admin
+    entrypoint: >
+      sh -c "celery -A core worker --beat --loglevel=info"
+    environment:
+      <<: [*postgres-env, *redis-env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  fastapi:
+    build: ../../backend/fastapi_receiver
+    entrypoint: >
+      sh -c "python main.py"
+    environment:
+      <<: *kafka-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+  
+  faust:
+    build: ../../backend/faust_worker
+    environment:
+      ADMIN_URL: django:8000
+      <<: *kafka-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:14.5-alpine
+    ports:
+      - 5432:5432
+    environment:
+      <<: *postgres-env
+    healthcheck:
+      test: pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.0.5
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: redis-cli ping
+      interval: 5s
+      timeout: 5s
+      retries: 100
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.1
+    ports:
+      - 29092:29092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    healthcheck:
+      test: nc -z localhost 9092 || exit -1
+      interval: 5s
+      timeout: 5s
+      retries: 100
+
+  zookeeper:
+    image: zookeeper:3.8
